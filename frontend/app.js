@@ -37,7 +37,7 @@ function renderEvents(events) {
     pane.scrollTop=follow?pane.scrollHeight:oldScroll;
   }
 }
-let focusKey = '', showFocus = false;
+let focusKey = '', showFocus = false, viewRevision = 0;
 function renderFocus(s) {
   const f = s.focus;
   const key = f ? `${f.captured}:${f.state}:${JSON.stringify(f.box)}:${f.refinement}` : '';
@@ -49,10 +49,19 @@ function renderFocus(s) {
     if (f && (!s.tracking || showFocus)) $('focus-image').src = '/api/focus/frame?t=' + Date.now();
     else $('focus-image').removeAttribute('src');
   }
+  if (s.view_revision !== viewRevision) {
+    viewRevision = s.view_revision;
+    showFocus = s.requested_view === 'search' && !!f;
+    if(showFocus) $('focus-image').src='/api/focus/frame?t='+Date.now();
+  }
   const states = {searching:'поиск…',found:'рамка получена (проверьте)',missing:'не найден',invalid:'некорректный ответ',error:'ошибка',limit:'лимит генерации',initializing:'инициализация трекера',tracking:'отслеживается',lost:'потерян — повторный поиск'};
   $('focus-status').textContent = f ? `${f.target} · ${states[f.state]} · ${f.live_box ? ' · px: '+f.live_box.join(', ') : ''}${s.tracking ? ' · потери: '+s.losses+' · повторы: '+s.retries : ''}` : 'Фокус не задан';
   $('focus-view').disabled = !f;
   $('focus-clear').disabled = !f;
+  $('emergency-clear').disabled = !f && !s.auto && !s.busy;
+  $('trajectory').checked=s.attention.trajectory;
+  if (![...$('verify-interval').options].some(o=>Number(o.value)===s.attention.verify_interval)) $('verify-interval').add(new Option(s.attention.verify_interval+' сек.',s.attention.verify_interval));
+  $('verify-interval').value=String(s.attention.verify_interval);
   $('find').disabled = !s.camera || !s.model || s.busy || s.auto;
   $('track').disabled = $('find').disabled;
   $('refine').disabled = $('find').disabled || s.tracking || !f?.box;
@@ -86,12 +95,15 @@ async function refresh() {
 }
 for(const id of ['cam','model','auto','snapshot']) $(id).onclick=async()=>{try{$('error').textContent='';if(['camera-on','auto-on','snapshot'].includes($(id).dataset.action))await save();await api('control/'+$(id).dataset.action,{});await refresh();}catch(e){$('error').textContent=e.message;}};
 $('save').onclick=async()=>{try{await save();$('error').textContent='Настройки применены';}catch(e){$('error').textContent=e.message;}};
-$('question').onsubmit=async e=>{e.preventDefault();try{await save();await api('question',{text:$('text').value});$('text').value='';await refresh();}catch(e){$('error').textContent=e.message;}};
+$('question').onsubmit=async e=>{e.preventDefault();try{const text=$('text').value.trim();if(!text)return;await save();await api('question',{text});$('text').value='';await refresh();}catch(e){$('error').textContent=e.message;}};
 for (const id of ['mirror','vertical_flip']) $(id).onchange=async()=>{try{await save();await refresh();}catch(e){$('error').textContent=e.message;}};
 $('find').onclick=async()=>{try{const text=$('target').value.trim();if(!text)throw Error('Введите название объекта');await save();await api('focus',{text});await refresh();}catch(e){$('error').textContent=e.message;}};
 $('track').onclick=async()=>{try{const text=$('target').value.trim();if(!text)throw Error('Введите название объекта');await save();await api('track',{text});showFocus=false;await refresh();}catch(e){$('error').textContent=e.message;}};
+$('emergency-clear').onclick=async()=>{try{await api('control/auto-off',{});await api('focus/clear',{});await refresh();}catch(e){$('error').textContent=e.message;}};
 $('focus-clear').onclick=async()=>{try{await api('focus/clear',{});await refresh();}catch(e){$('error').textContent=e.message;}};
 $('focus-view').onclick=()=>{showFocus=!showFocus;if(showFocus)$('focus-image').src='/api/focus/frame?t='+Date.now();refresh();};
 $('refine').onclick=async()=>{try{await api('focus/refine',{});await refresh();}catch(e){$('error').textContent=e.message;}};
 for(const id of ['trajectory','verify-interval']) $(id).onchange=async()=>{try{await api('attention/settings',{trajectory:$('trajectory').checked,verify_interval:Number($('verify-interval').value)});await refresh();}catch(e){$('error').textContent=e.message;}};
 $('help').onclick=()=>$('manual').showModal();refresh();setInterval(refresh,1000);
+
+$('text').addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey&&!e.isComposing){e.preventDefault();if(!$('question').querySelector('button').disabled)$('question').requestSubmit();}});

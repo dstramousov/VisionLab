@@ -13,3 +13,5 @@ main>aside, .center{min-height:0;min-width:0;overflow:auto}section{padding:9px;m
 .focus-controls{flex-wrap:wrap}.focus-controls input{flex-basis:100%}.focus-controls button{flex:1}
 
 .attention-options{display:flex;gap:12px;align-items:center;flex-wrap:wrap}.attention-options label{display:flex;align-items:center;gap:5px}.attention-options select{width:auto}
+
+.engineering{margin-top:6px}.engineering>summary{cursor:pointer;color:var(--muted)}#emergency-clear{align-self:flex-start;margin-top:4px}#focus-status{margin-top:5px}

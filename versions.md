@@ -29,3 +29,15 @@ Initial control and observation panel.
 - Optional periodic Qwen verification against the synchronized CSRT rectangle (IoU threshold 0.2; disabled by default).
 - Draw bounded center trajectory; clear it on target changes and loss.
 - Attention settings are session-only. Single-target tracking remains in place.
+
+## v0.0.5 -> v0.0.6
+
+- Unified dialogue with validated model-selected visual commands and bounded session context.
+- Collapsible engineering controls and direct stop button.
+- README is now author-maintained; future patches must not modify it.
+- One target only; no autonomous notifications or persistent dialogue context.
+
+## v0.0.6 -> v0.0.7
+
+- Request non-thinking JSON output for dialogue routing; keep regular visual answers unchanged.
+- Report completion limits explicitly; reject incomplete or invalid commands.

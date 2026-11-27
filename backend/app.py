@@ -22,6 +22,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from backend.grounding import parse_box
+from backend.dialog import ROUTER_PROMPT, Command, parse_command, context_messages
 from backend.attention import crop_region, restore_box, overlap
 from backend.tracking import pixel_box, create_tracker
 
@@ -101,6 +102,8 @@ class Lab:
         self.root = Path(raw.pop('llmlab_root'))
         self.settings = Settings(**raw)
         self.pending: dict[str, Any] | None = None
+        self.view_revision = 0
+        self.requested_view = "live"
         self.orientation_epoch = 0
         self.focus: dict[str, Any] | None = None
         self.focus_frame: bytes | None = None
@@ -362,7 +365,7 @@ class Lab:
                     process.wait()
             self.process = None
 
-    def submit(self, text: str, kind: str) -> None:
+    def submit(self, text: str, kind: str, chat_text: str | None = None) -> None:
         with self.lock:
             if kind in ('focus', 'track', 'refine') and self.auto:
                 raise RuntimeError('Остановите автоанализ перед поиском объекта')
@@ -384,7 +387,7 @@ class Lab:
                 source, source_stamp, *reference = self.live_sample
             self.busy = True
             self.started = time.monotonic()
-            self.pending = {'captured': source_stamp if kind in ('refine', 'verify') else self.frame_time, 'kind': kind, 'question': text, 'answer': '', 'reasoning': '', 'seconds': 0, 'pending': True}
+            self.pending = {'captured': source_stamp if kind in ('refine', 'verify') else self.frame_time, 'kind': 'question' if chat_text is not None else kind, 'question': chat_text if chat_text is not None else text, 'answer': '', 'reasoning': '', 'seconds': 0, 'pending': True}
             self.error = ''
             frame, stamp = (source, source_stamp) if kind in ('refine', 'verify') else (self.frame, self.frame_time)
             self.last, self.last_time = frame, stamp
@@ -401,9 +404,9 @@ class Lab:
                 self.focus_frame = frame
             track_epoch = self.track_epoch
             submitted = self.started
-        threading.Thread(target=self.infer, args=(text, kind, frame, stamp, settings, epoch, track_epoch, submitted, region, reference), daemon=True).start()
+        threading.Thread(target=self.infer, args=(text, kind, frame, stamp, settings, epoch, track_epoch, submitted, region, reference, chat_text), daemon=True).start()
 
-    def infer(self, text: str, kind: str, frame: bytes, stamp: str, settings: Settings, epoch: int, track_epoch: int, submitted: float, region: tuple | None = None, reference: list | None = None) -> None:
+    def infer(self, text: str, kind: str, frame: bytes, stamp: str, settings: Settings, epoch: int, track_epoch: int, submitted: float, region: tuple | None = None, reference: list | None = None, chat_text: str | None = None) -> None:
         start = time.monotonic()
         try:
             content = []
@@ -421,6 +424,12 @@ class Lab:
                 text_for_model = text
             content.extend([{'type': 'text', 'text': 'Текущий кадр:'}, image_part(region[0] if region else frame), {'type': 'text', 'text': text_for_model}])
             payload = {'messages': [{'role': 'system', 'content': ('You localize objects in images. Return only the requested JSON.' if kind in ('focus', 'track', 'refine', 'verify') else settings.prompt)}, {'role': 'user', 'content': content}], 'max_tokens': settings.max_tokens, 'temperature': 0.1 if kind in ('focus', 'track', 'refine', 'verify') else settings.temperature, 'stream': True}
+            if kind == 'question':
+                with self.lock:
+                    history = context_messages(self.events)
+                    focus = dict(self.focus) if self.focus else None
+                payload['messages'][0]['content'] += '\nТекущий фокус системы: ' + json.dumps(focus, ensure_ascii=False)
+                payload['messages'][1:1] = history
             raw_answer = reasoning = ''
             finish = None
             with requests.post(f'{API}/v1/chat/completions', json=payload, timeout=(10, 180), stream=True) as response:
@@ -442,7 +451,7 @@ class Lab:
                     answer, thought = split_reasoning(raw_answer, reasoning)
                     with self.lock:
                         if self.pending is not None:
-                            self.pending.update(answer=answer, reasoning=thought, seconds=round(time.monotonic()-start, 2))
+                            self.pending.update(answer=answer if chat_text is None or kind == "question" else "", reasoning=thought, seconds=round(time.monotonic()-start, 2))
             answer, thought = split_reasoning(raw_answer, reasoning)
             if finish is None:
                 raise RuntimeError('Поток ответа завершился без причины остановки')
@@ -492,15 +501,24 @@ class Lab:
                 answer += '\n[Достигнут лимит генерации]'
             if not answer.strip() and kind not in ('focus', 'track', 'refine', 'verify'):
                 raise RuntimeError('Модель не вернула текст ответа')
+            if chat_text is not None and kind in ('focus', 'track', 'refine'):
+                labels = {'found': 'Координаты получены', 'missing': 'Объект не найден', 'limit': 'Достигнут лимит генерации', 'invalid': 'Некорректный ответ локализации'}
+                answer = f'{text}: {labels.get(state, state)}.'
+                if kind == 'track':
+                    answer += ' Запрошено отслеживание; фактическое состояние отображается в панели фокуса.'
+                if kind == 'refine' and state != 'found':
+                    answer += ' Прежняя рамка сохранена.'
             elapsed = time.monotonic() - start
-            event = {'captured': stamp, 'kind': kind, 'question': text, 'answer': answer, 'reasoning': thought, 'finish': finish, 'seconds': round(elapsed, 2)}
+            event_kind = 'question' if chat_text is not None else kind
+            event_text = chat_text if chat_text is not None else text
+            event = {'captured': stamp, 'kind': event_kind, 'question': event_text, 'answer': answer, 'reasoning': thought, 'finish': finish, 'seconds': round(elapsed, 2)}
             if kind == 'auto':
                 with self.lock:
                     if not self.camera_stop.is_set() and epoch == self.orientation_epoch:
                         self.previous_frame = frame
             if settings.save_observations:
                 with sqlite3.connect(DATA / 'observations.sqlite3') as db:
-                    db.execute('INSERT INTO events (captured,kind,question,answer,seconds,settings,frame) VALUES (?,?,?,?,?,?,?)', (stamp, kind, text, answer, elapsed, settings.model_dump_json(), frame if settings.save_frames else None))
+                    db.execute('INSERT INTO events (captured,kind,question,answer,seconds,settings,frame) VALUES (?,?,?,?,?,?,?)', (stamp, event_kind, event_text, answer, elapsed, settings.model_dump_json(), frame if settings.save_frames else None))
             with self.lock:
                 self.duration = elapsed
                 self.events = (self.events + [event])[-100:]
@@ -509,6 +527,8 @@ class Lab:
             LOG.exception('Inference failed')
             with self.lock:
                 self.error = str(exc)
+                if chat_text is not None:
+                    self.events = (self.events + [{"captured": stamp, "kind": "question", "question": chat_text, "answer": "Ошибка: " + str(exc), "seconds": round(time.monotonic()-start, 2)}])[-100:]
                 self.auto = False
                 if kind in ('focus', 'track', 'refine') and epoch == self.orientation_epoch and track_epoch == self.track_epoch and self.focus is not None:
                     if kind == 'refine':
@@ -520,6 +540,140 @@ class Lab:
             with self.lock:
                 self.busy = False
                 self.pending = None
+
+    def submit_dialog(self, text: str) -> None:
+        """Reserve inference slot for natural-language command selection."""
+        with self.lock:
+            if self.busy:
+                raise RuntimeError('Анализ уже выполняется')
+            if not self.frame or not self.ready():
+                raise RuntimeError('Необходимы кадр и готовая модель')
+            self.busy = True
+            self.started = time.monotonic()
+            self.error = ''
+            stamp = datetime.now().astimezone().isoformat(timespec='milliseconds')
+            self.pending = {'captured': stamp, 'kind': 'question', 'question': text,
+                            'answer': 'Определяю команду…', 'seconds': 0, 'pending': True}
+            context = {'focus': self.focus, 'tracking': self.tracking, 'auto': self.auto}
+            messages = [{'role': 'system', 'content': ROUTER_PROMPT},
+                        *context_messages(self.events),
+                        {'role': 'user', 'content': json.dumps({'state': context, 'request': text}, ensure_ascii=False)}]
+            epochs = (self.orientation_epoch, self.track_epoch)
+        threading.Thread(target=self.route_dialog, args=(text, stamp, messages, epochs), daemon=True).start()
+
+    def route_dialog(self, text: str, stamp: str, messages: list, epochs: tuple[int, int]) -> None:
+        """Classify the prompt and dispatch only a validated operation."""
+        start = time.monotonic()
+        handed_off = False
+        try:
+            response = requests.post(f'{API}/v1/chat/completions', json={
+                'messages': messages, 'max_tokens': 1024, 'temperature': 0,
+                'chat_template_kwargs': {'enable_thinking': False},
+                'response_format': {'type': 'json_object'},
+                'stream': False}, timeout=(10, 90))
+            response.raise_for_status()
+            packet = response.json()
+            choice = packet['choices'][0]
+            finish = choice.get('finish_reason')
+            if finish != 'stop':
+                LOG.warning('Router finish=%s usage=%s content_chars=%d reasoning_chars=%d',
+                            finish, packet.get('usage'),
+                            len(choice['message'].get('content') or ''),
+                            len(choice['message'].get('reasoning_content') or ''))
+                if finish == 'length':
+                    raise ValueError('Маршрутизация: достигнут лимит генерации')
+                raise ValueError(f'Маршрутизация не завершена ({finish})')
+            answer, _ = split_reasoning(choice['message'].get('content') or '', '')
+            command = parse_command(answer)
+            with self.lock:
+                if epochs != (self.orientation_epoch, self.track_epoch) or not self.frame or not self.ready():
+                    raise RuntimeError('Состояние изменилось; повторите команду')
+                # Hand off under the same lock, so the background loop cannot steal the slot.
+                try:
+                    result = self.execute_dialog(command, text)
+                except Exception:
+                    self.busy = True
+                    raise
+                handed_off = result is None
+                if not handed_off:
+                    self.dialog_event(text, stamp, result, start)
+        except Exception as exc:
+            LOG.exception('Dialogue routing failed')
+            with self.lock:
+                self.dialog_event(text, stamp, 'Команда не выполнена: ' + str(exc), start)
+        finally:
+            if not handed_off:
+                with self.lock:
+                    self.busy = False
+                    self.pending = None
+
+    def dialog_event(self, text: str, stamp: str, answer: str, start: float) -> None:
+        """Record a confirmed command result in dialogue history."""
+        elapsed = time.monotonic() - start
+        self.duration = elapsed
+        event = {'captured': stamp, 'kind': 'question', 'question': text,
+                 'answer': answer, 'seconds': round(elapsed, 2), 'reasoning': ''}
+        self.events = (self.events + [event])[-100:]
+        if self.settings.save_observations:
+            try:
+                with sqlite3.connect(DATA / 'observations.sqlite3') as db:
+                    db.execute('INSERT INTO events (captured,kind,question,answer,seconds,settings,frame) VALUES (?,?,?,?,?,?,?)',
+                               (stamp, 'question', text, answer, elapsed, self.settings.model_dump_json(), None))
+            except sqlite3.Error:
+                LOG.exception('Cannot save dialogue event')
+
+    def execute_dialog(self, command: Command, text: str) -> str | None:
+        """Dispatch an allowlisted command while holding the state lock."""
+        action = command.action
+        if action == 'ask':
+            self.busy = False
+            self.submit(text, 'question', text)
+            return None
+        if action in ('find', 'track', 'refine'):
+            if action == 'track':
+                create_tracker()
+            target = command.target.strip() if action != 'refine' else (self.focus or {}).get('target', '')
+            if not target:
+                raise RuntimeError('Сначала найдите объект')
+            self.busy = False
+            self.submit(target, 'focus' if action == 'find' else action, text)
+            if action == 'track':
+                self.losses = self.retries = self.verifications = 0
+                self.apply_dialog_options(command)
+            return None
+        if action == 'clear':
+            self.focus = self.focus_frame = None
+            self.reset_tracking()
+            return 'Фокус снят, отслеживание остановлено.'
+        if action == 'auto_on':
+            if self.tracking:
+                raise RuntimeError('Сначала остановите отслеживание')
+            self.previous_frame = None
+            self.auto = True
+            return 'Автоматический анализ включён.'
+        if action == 'auto_off':
+            self.auto = False
+            return 'Автоматический анализ выключен.'
+        if action == 'options':
+            self.apply_dialog_options(command)
+            return 'Настройки внимания изменены.'
+        if action in ('search_view', 'live_view'):
+            if action == 'search_view' and not self.focus_frame:
+                raise RuntimeError('Нет кадра поиска')
+            self.requested_view = 'search' if action == 'search_view' else 'live'
+            self.view_revision += 1
+            return 'Показан кадр поиска.' if action == 'search_view' else 'Показано живое видео.'
+        return command.message
+
+    def apply_dialog_options(self, command: Command) -> None:
+        """Apply only provided attention settings."""
+        values = self.attention.model_dump()
+        for key in ('trajectory', 'verify_interval'):
+            value = getattr(command, key)
+            if value is not None:
+                values[key] = value
+        self.attention = AttentionSettings(**values)
+        self.verify_at = time.monotonic() + self.attention.verify_interval
 
     def loop(self) -> None:
         next_at = 0.0
@@ -574,7 +728,7 @@ async def lifespan(app: FastAPI):
         lab.model_off()
 
 
-app = FastAPI(title='VisionLab', version='0.0.5', lifespan=lifespan)
+app = FastAPI(title='VisionLab', version='0.0.7', lifespan=lifespan)
 
 
 @app.middleware('http')
@@ -596,7 +750,7 @@ def status() -> dict[str, Any]:
     except (OSError, subprocess.SubprocessError, IndexError):
         gpu = '—'
     with lab.lock:
-        return {'camera': lab.frame is not None, 'camera_active': bool(lab.camera_thread and lab.camera_thread.is_alive()), 'model': lab.ready(), 'model_active': bool(lab.process and lab.process.poll() is None), 'auto': lab.auto, 'busy': lab.busy, 'fps': round(lab.fps, 1), 'error': lab.error, 'duration': round(lab.duration, 2), 'ram': round(psutil.virtual_memory().available / 1024**3, 1), 'gpu': gpu, 'last_time': lab.last_time, 'elapsed': round(time.monotonic()-lab.started, 1) if lab.busy else 0, 'change_score': round(lab.change_score, 2), 'focus': dict(lab.focus) if lab.focus else None, 'tracking': lab.tracking, 'losses': lab.losses, 'retries': lab.retries, 'attention': lab.attention.model_dump(), 'verifications': lab.verifications, 'settings': lab.settings.model_dump(), 'devices': sorted(str(p) for p in Path('/dev').glob('video[0-9]*'))}
+        return {'camera': lab.frame is not None, 'camera_active': bool(lab.camera_thread and lab.camera_thread.is_alive()), 'model': lab.ready(), 'model_active': bool(lab.process and lab.process.poll() is None), 'auto': lab.auto, 'busy': lab.busy, 'fps': round(lab.fps, 1), 'error': lab.error, 'duration': round(lab.duration, 2), 'ram': round(psutil.virtual_memory().available / 1024**3, 1), 'gpu': gpu, 'last_time': lab.last_time, 'elapsed': round(time.monotonic()-lab.started, 1) if lab.busy else 0, 'change_score': round(lab.change_score, 2), 'focus': dict(lab.focus) if lab.focus else None, 'tracking': lab.tracking, 'losses': lab.losses, 'retries': lab.retries, 'attention': lab.attention.model_dump(), 'verifications': lab.verifications, 'view_revision': lab.view_revision, 'requested_view': lab.requested_view, 'settings': lab.settings.model_dump(), 'devices': sorted(str(p) for p in Path('/dev').glob('video[0-9]*'))}
 
 
 @app.post('/api/settings')
@@ -655,9 +809,9 @@ def control(action: str) -> dict[str, bool]:
 
 @app.post('/api/question')
 def question(value: Question) -> dict[str, bool]:
-    """Analyze a fresh frame with a user question."""
+    """Route a dialogue prompt to a visual question or validated control action."""
     try:
-        lab.submit(value.text, 'question')
+        lab.submit_dialog(value.text)
     except RuntimeError as exc:
         raise HTTPException(409, str(exc)) from exc
     return {'ok': True}

@@ -1,6 +1,6 @@
 # VisionLab
 
-Локальная лаборатория визуального восприятия. Версия 0.0.3.
+Локальная лаборатория визуального восприятия. Версия 0.0.5.
 
 ## Запуск
 
@@ -27,3 +27,10 @@ python3 -m venv .venv
 - Replace opencv-python-headless with opencv-contrib-python-headless (uninstall the former first).
 - Tracking and automatic scene analysis are mutually exclusive. Tracker drift and capture slowdown are possible.
 - Add ./stop, ./restart and ./status for project-owned backend processes; restart runs in foreground.
+
+## v0.0.5
+
+- Refine frozen bounding boxes with a padded enlarged crop and coordinate remapping.
+- Optional periodic Qwen verification against the synchronized CSRT rectangle (IoU threshold 0.2; disabled by default).
+- Draw bounded center trajectory; clear it on target changes and loss.
+- Attention settings are session-only. Single-target tracking remains in place.

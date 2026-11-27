@@ -22,6 +22,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from backend.grounding import parse_box
+from backend.attention import crop_region, restore_box, overlap
 from backend.tracking import pixel_box, create_tracker
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -85,6 +86,13 @@ class Question(BaseModel):
     text: str = Field(min_length=1, max_length=4000)
 
 
+class AttentionSettings(BaseModel):
+    """Configure optional tracking verification and trajectory overlay."""
+
+    verify_interval: int = Field(default=0, ge=0, le=120)
+    trajectory: bool = True
+
+
 class Lab:
     """Own camera, child process and serialized inference jobs."""
 
@@ -104,6 +112,12 @@ class Lab:
         self.retry_at = 0.0
         self.losses = 0
         self.retries = 0
+        self.attention = AttentionSettings()
+        self.verify_at = 0.0
+        self.verifications = 0
+        self.trajectory = deque(maxlen=60)
+        self.last_trajectory = 0.0
+        self.live_sample = None
         self.started = 0.0
         self.previous_frame: bytes | None = None
         self.change_score = 0.0
@@ -145,6 +159,8 @@ class Lab:
         self.track_job = None
         self.track_frame = None
         self.history.clear()
+        self.trajectory.clear()
+        self.live_sample = None
 
     def tracking_event(self, message: str) -> None:
         """Record a tracking state transition while holding the state lock."""
@@ -250,20 +266,33 @@ class Lab:
                         with self.lock:
                             if track_epoch == self.track_epoch and self.tracking and self.focus:
                                 self.focus.update(state='lost', live_box=None)
+                                self.trajectory.clear()
+                                self.live_sample = None
                                 self.track_frame = None
                                 self.losses += 1
                                 self.retry_at = time.monotonic() + 2
                                 self.tracking_event(str(exc))
                 if rectangle is not None:
                     x, y, w, h = map(int, rectangle)
+                    with self.lock:
+                        if track_epoch != self.track_epoch or not self.tracking or not self.focus:
+                            continue
+                        if self.focus['state'] != 'tracking':
+                            self.tracking_event('Начато отслеживание: ' + self.focus['target'])
+                            self.verify_at = now + self.attention.verify_interval
+                        self.focus.update(state='tracking', live_box=[x, y, w, h])
+                        self.live_sample = (encoded.tobytes(), self.frame_time, (x, y, w, h), image.shape[1], image.shape[0])
+                        if now - self.last_trajectory >= 0.15:
+                            self.trajectory.append((x+w//2, y+h//2))
+                            self.last_trajectory = now
+                        points = list(self.trajectory) if self.attention.trajectory else []
                     annotated = image.copy()
+                    for first, second in zip(points, points[1:]):
+                        cv2.line(annotated, first, second, (230, 180, 60), 2)
                     cv2.rectangle(annotated, (x, y), (x+w-1, y+h-1), (70, 230, 70), 2)
                     valid, overlay = cv2.imencode('.jpg', annotated)
                     with self.lock:
                         if track_epoch == self.track_epoch and self.tracking and self.focus:
-                            if self.focus['state'] != 'tracking':
-                                self.tracking_event('Начато отслеживание: ' + self.focus['target'])
-                            self.focus.update(state='tracking', live_box=[x,y,w,h])
                             self.track_frame = overlay.tobytes() if valid else None
         except Exception as exc:
             LOG.exception('Capture failed')
@@ -335,36 +364,50 @@ class Lab:
 
     def submit(self, text: str, kind: str) -> None:
         with self.lock:
-            if kind in ('focus', 'track') and self.auto:
+            if kind in ('focus', 'track', 'refine') and self.auto:
                 raise RuntimeError('Остановите автоанализ перед поиском объекта')
             if self.busy:
                 raise RuntimeError('Анализ уже выполняется')
             if not self.frame or not self.ready():
                 raise RuntimeError('Необходимы кадр и готовая модель')
+            region = None
+            reference = None
+            if kind == 'refine':
+                if self.tracking or not self.focus or not self.focus.get('box') or not self.focus_frame:
+                    raise RuntimeError('Сначала найдите объект на снимке')
+                source = self.focus_frame
+                source_stamp = self.focus['captured']
+                region = crop_region(source, self.focus['box'])
+            elif kind == 'verify':
+                if not self.tracking or not self.live_sample or not self.focus or self.focus['state'] != 'tracking':
+                    raise RuntimeError('Нет активного трекера')
+                source, source_stamp, *reference = self.live_sample
             self.busy = True
             self.started = time.monotonic()
-            self.pending = {'captured': self.frame_time, 'kind': kind, 'question': text, 'answer': '', 'reasoning': '', 'seconds': 0, 'pending': True}
+            self.pending = {'captured': source_stamp if kind in ('refine', 'verify') else self.frame_time, 'kind': kind, 'question': text, 'answer': '', 'reasoning': '', 'seconds': 0, 'pending': True}
             self.error = ''
-            frame, stamp = self.frame, self.frame_time
+            frame, stamp = (source, source_stamp) if kind in ('refine', 'verify') else (self.frame, self.frame_time)
             self.last, self.last_time = frame, stamp
             settings = self.settings.model_copy()
             epoch = self.orientation_epoch
-            if kind in ('focus', 'track'):
+            if kind in ('focus', 'track', 'refine'):
+                self.trajectory.clear()
+                self.live_sample = None
                 self.track_epoch += 1
                 self.track_frame = None
                 self.track_job = None
                 self.tracking = kind == 'track'
-                self.focus = {'target': text, 'captured': stamp, 'state': 'searching', 'box': None}
+                self.focus = {'target': text, 'captured': stamp, 'state': 'searching', 'box': self.focus['box'] if kind == 'refine' else None}
                 self.focus_frame = frame
             track_epoch = self.track_epoch
             submitted = self.started
-        threading.Thread(target=self.infer, args=(text, kind, frame, stamp, settings, epoch, track_epoch, submitted), daemon=True).start()
+        threading.Thread(target=self.infer, args=(text, kind, frame, stamp, settings, epoch, track_epoch, submitted, region, reference), daemon=True).start()
 
-    def infer(self, text: str, kind: str, frame: bytes, stamp: str, settings: Settings, epoch: int, track_epoch: int, submitted: float) -> None:
+    def infer(self, text: str, kind: str, frame: bytes, stamp: str, settings: Settings, epoch: int, track_epoch: int, submitted: float, region: tuple | None = None, reference: list | None = None) -> None:
         start = time.monotonic()
         try:
             content = []
-            if kind in ('focus', 'track'):
+            if kind in ('focus', 'track', 'refine', 'verify'):
                 text_for_model = (
                     'Locate the requested object in this image. Return only JSON '
                     'with one key "box": [x1,y1,x2,y2] using integer coordinates '
@@ -376,8 +419,8 @@ class Lab:
                 text_for_model = 'Сравни предыдущий и текущий кадры. Кратко опиши только видимые изменения; если их нет, так и скажи.'
             else:
                 text_for_model = text
-            content.extend([{'type': 'text', 'text': 'Текущий кадр:'}, image_part(frame), {'type': 'text', 'text': text_for_model}])
-            payload = {'messages': [{'role': 'system', 'content': ('You localize objects in images. Return only the requested JSON.' if kind in ('focus', 'track') else settings.prompt)}, {'role': 'user', 'content': content}], 'max_tokens': settings.max_tokens, 'temperature': 0.1 if kind in ('focus', 'track') else settings.temperature, 'stream': True}
+            content.extend([{'type': 'text', 'text': 'Текущий кадр:'}, image_part(region[0] if region else frame), {'type': 'text', 'text': text_for_model}])
+            payload = {'messages': [{'role': 'system', 'content': ('You localize objects in images. Return only the requested JSON.' if kind in ('focus', 'track', 'refine', 'verify') else settings.prompt)}, {'role': 'user', 'content': content}], 'max_tokens': settings.max_tokens, 'temperature': 0.1 if kind in ('focus', 'track', 'refine', 'verify') else settings.temperature, 'stream': True}
             raw_answer = reasoning = ''
             finish = None
             with requests.post(f'{API}/v1/chat/completions', json=payload, timeout=(10, 180), stream=True) as response:
@@ -403,18 +446,39 @@ class Lab:
             answer, thought = split_reasoning(raw_answer, reasoning)
             if finish is None:
                 raise RuntimeError('Поток ответа завершился без причины остановки')
-            if kind in ('focus', 'track'):
+            if kind in ('focus', 'track', 'refine', 'verify'):
                 box = None
                 state = 'limit' if finish == 'length' else 'invalid'
                 if finish == 'stop':
                     try:
                         box = parse_box(answer)
                         state = 'found' if box is not None else 'missing'
+                        if box is not None and region:
+                            box = restore_box(box, region[1], region[2])
                     except ValueError:
                         pass
                 with self.lock:
                     if epoch == self.orientation_epoch and track_epoch == self.track_epoch and self.focus is not None:
-                        self.focus.update(state=state, box=box)
+                        if kind == 'verify':
+                            if self.tracking and self.focus['state'] == 'tracking' and reference:
+                                rect, width, height = reference
+                                score = overlap(rect, pixel_box(box, width, height)) if box else 0.0
+                                self.verifications += 1
+                                self.focus['verification'] = state if state != 'found' else f'IoU {score:.2f}'
+                                if state == 'missing' or (state == 'found' and score < 0.2):
+                                    self.track_epoch += 1
+                                    self.focus.update(state='lost', live_box=None)
+                                    self.track_frame = None
+                                    self.live_sample = None
+                                    self.trajectory.clear()
+                                    self.losses += 1
+                                    self.retry_at = time.monotonic() + 1
+                                    self.tracking_event('Qwen: возможная потеря объекта')
+                        else:
+                            if kind == 'refine' and box is None:
+                                self.focus.update(state='found', refinement=state)
+                            else:
+                                self.focus.update(state=state, box=box, refinement='found' if kind == 'refine' else None)
                         if kind == 'track':
                             if box is not None:
                                 self.track_job = (frame, box, submitted)
@@ -422,11 +486,11 @@ class Lab:
                             else:
                                 self.retry_at = time.monotonic() + 3
                         self.tracking_event(f'{text}: {state}')
-            if kind in ('focus', 'track') and not answer.strip() and finish != 'length':
+            if kind in ('focus', 'track', 'refine', 'verify') and not answer.strip() and finish != 'length':
                 answer = '[Пустой ответ локализации]'
             if finish == 'length':
                 answer += '\n[Достигнут лимит генерации]'
-            if not answer.strip() and kind not in ('focus', 'track'):
+            if not answer.strip() and kind not in ('focus', 'track', 'refine', 'verify'):
                 raise RuntimeError('Модель не вернула текст ответа')
             elapsed = time.monotonic() - start
             event = {'captured': stamp, 'kind': kind, 'question': text, 'answer': answer, 'reasoning': thought, 'finish': finish, 'seconds': round(elapsed, 2)}
@@ -446,8 +510,11 @@ class Lab:
             with self.lock:
                 self.error = str(exc)
                 self.auto = False
-                if kind in ('focus', 'track') and epoch == self.orientation_epoch and track_epoch == self.track_epoch and self.focus is not None:
-                    self.focus.update(state='error', box=None)
+                if kind in ('focus', 'track', 'refine') and epoch == self.orientation_epoch and track_epoch == self.track_epoch and self.focus is not None:
+                    if kind == 'refine':
+                        self.focus.update(state='found', refinement='error')
+                    else:
+                        self.focus.update(state='error', box=None)
                     self.retry_at = time.monotonic() + 3
         finally:
             with self.lock:
@@ -467,6 +534,14 @@ class Lab:
                         self.tracking_event('Повторный поиск: ' + self.focus['target'])
                     except RuntimeError:
                         self.retry_at = time.monotonic() + 3
+                if (self.tracking and self.focus and self.focus['state'] == 'tracking'
+                        and self.attention.verify_interval and not self.busy
+                        and time.monotonic() >= self.verify_at):
+                    self.verify_at = time.monotonic() + self.attention.verify_interval
+                    try:
+                        self.submit(self.focus['target'], 'verify')
+                    except RuntimeError:
+                        pass
                 if not self.auto or self.busy:
                     next_at = time.monotonic() + self.settings.interval
                     continue
@@ -499,7 +574,7 @@ async def lifespan(app: FastAPI):
         lab.model_off()
 
 
-app = FastAPI(title='VisionLab', version='0.0.4', lifespan=lifespan)
+app = FastAPI(title='VisionLab', version='0.0.5', lifespan=lifespan)
 
 
 @app.middleware('http')
@@ -521,7 +596,7 @@ def status() -> dict[str, Any]:
     except (OSError, subprocess.SubprocessError, IndexError):
         gpu = '—'
     with lab.lock:
-        return {'camera': lab.frame is not None, 'camera_active': bool(lab.camera_thread and lab.camera_thread.is_alive()), 'model': lab.ready(), 'model_active': bool(lab.process and lab.process.poll() is None), 'auto': lab.auto, 'busy': lab.busy, 'fps': round(lab.fps, 1), 'error': lab.error, 'duration': round(lab.duration, 2), 'ram': round(psutil.virtual_memory().available / 1024**3, 1), 'gpu': gpu, 'last_time': lab.last_time, 'elapsed': round(time.monotonic()-lab.started, 1) if lab.busy else 0, 'change_score': round(lab.change_score, 2), 'focus': dict(lab.focus) if lab.focus else None, 'tracking': lab.tracking, 'losses': lab.losses, 'retries': lab.retries, 'settings': lab.settings.model_dump(), 'devices': sorted(str(p) for p in Path('/dev').glob('video[0-9]*'))}
+        return {'camera': lab.frame is not None, 'camera_active': bool(lab.camera_thread and lab.camera_thread.is_alive()), 'model': lab.ready(), 'model_active': bool(lab.process and lab.process.poll() is None), 'auto': lab.auto, 'busy': lab.busy, 'fps': round(lab.fps, 1), 'error': lab.error, 'duration': round(lab.duration, 2), 'ram': round(psutil.virtual_memory().available / 1024**3, 1), 'gpu': gpu, 'last_time': lab.last_time, 'elapsed': round(time.monotonic()-lab.started, 1) if lab.busy else 0, 'change_score': round(lab.change_score, 2), 'focus': dict(lab.focus) if lab.focus else None, 'tracking': lab.tracking, 'losses': lab.losses, 'retries': lab.retries, 'attention': lab.attention.model_dump(), 'verifications': lab.verifications, 'settings': lab.settings.model_dump(), 'devices': sorted(str(p) for p in Path('/dev').glob('video[0-9]*'))}
 
 
 @app.post('/api/settings')
@@ -605,9 +680,31 @@ def track(value: Question) -> dict[str, bool]:
         create_tracker()
         with lab.lock:
             lab.submit(value.text, 'track')
-            lab.losses = lab.retries = 0
+            lab.losses = lab.retries = lab.verifications = 0
     except RuntimeError as exc:
         raise HTTPException(409, str(exc)) from exc
+    return {'ok': True}
+
+
+@app.post('/api/attention/settings')
+def attention_settings(value: AttentionSettings) -> dict[str, bool]:
+    """Apply session-only verification and trajectory settings."""
+    with lab.lock:
+        lab.attention = value
+        lab.verify_at = time.monotonic() + value.verify_interval
+    return {'ok': True}
+
+
+@app.post('/api/focus/refine')
+def refine_focus() -> dict[str, bool]:
+    """Refine the frozen localization using an enlarged padded crop."""
+    with lab.lock:
+        if not lab.focus:
+            raise HTTPException(409, 'Сначала найдите объект')
+        try:
+            lab.submit(lab.focus['target'], 'refine')
+        except (RuntimeError, ValueError) as exc:
+            raise HTTPException(409, str(exc)) from exc
     return {'ok': True}
 
 

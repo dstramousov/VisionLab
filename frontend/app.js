@@ -40,13 +40,13 @@ function renderEvents(events) {
 let focusKey = '', showFocus = false;
 function renderFocus(s) {
   const f = s.focus;
-  const key = f ? `${f.captured}:${f.state === 'found'}` : '';
+  const key = f ? `${f.captured}:${f.state}:${JSON.stringify(f.box)}:${f.refinement}` : '';
   if (key !== focusKey) {
     focusKey = key;
     if (f && f.state === 'found') showFocus = true;
     if (s.tracking) showFocus = false;
     if (!f) showFocus = false;
-    if (f) $('focus-image').src = '/api/focus/frame?t=' + Date.now();
+    if (f && (!s.tracking || showFocus)) $('focus-image').src = '/api/focus/frame?t=' + Date.now();
     else $('focus-image').removeAttribute('src');
   }
   const states = {searching:'поиск…',found:'рамка получена (проверьте)',missing:'не найден',invalid:'некорректный ответ',error:'ошибка',limit:'лимит генерации',initializing:'инициализация трекера',tracking:'отслеживается',lost:'потерян — повторный поиск'};
@@ -55,6 +55,9 @@ function renderFocus(s) {
   $('focus-clear').disabled = !f;
   $('find').disabled = !s.camera || !s.model || s.busy || s.auto;
   $('track').disabled = $('find').disabled;
+  $('refine').disabled = $('find').disabled || s.tracking || !f?.box;
+  if (f?.refinement) $('focus-status').textContent += ' · уточнение: '+(states[f.refinement] || f.refinement);
+  if (s.tracking) $('focus-status').textContent += ' · проверок: '+s.verifications+(f?.verification?' · '+f.verification:'');
   $('track').classList.toggle('active',s.tracking);
   $('focus-view').textContent = showFocus ? 'Живое видео' : 'Кадр поиска';
   $('focus-image').hidden = !showFocus || !f;
@@ -64,7 +67,7 @@ function renderFocus(s) {
 async function refresh() {
   if(polling)return; polling=true;
   try {
-    const s=await api('status'); if(!initialized){loadSettings(s);initialized=true;}
+    const s=await api('status'); if(!initialized){loadSettings(s);$('trajectory').checked=s.attention.trajectory;$('verify-interval').value=String(s.attention.verify_interval);initialized=true;}
     actionButton('cam',s.camera_active,'Включить камеру','Выключить камеру','camera-on','camera-off');
     actionButton('model',s.model_active,'Включить модель','Выключить модель','model-on','model-off');
     actionButton('auto',s.auto,'Начать анализ','Остановить анализ','auto-on','auto-off');
@@ -88,5 +91,7 @@ for (const id of ['mirror','vertical_flip']) $(id).onchange=async()=>{try{await 
 $('find').onclick=async()=>{try{const text=$('target').value.trim();if(!text)throw Error('Введите название объекта');await save();await api('focus',{text});await refresh();}catch(e){$('error').textContent=e.message;}};
 $('track').onclick=async()=>{try{const text=$('target').value.trim();if(!text)throw Error('Введите название объекта');await save();await api('track',{text});showFocus=false;await refresh();}catch(e){$('error').textContent=e.message;}};
 $('focus-clear').onclick=async()=>{try{await api('focus/clear',{});await refresh();}catch(e){$('error').textContent=e.message;}};
-$('focus-view').onclick=()=>{showFocus=!showFocus;refresh();};
+$('focus-view').onclick=()=>{showFocus=!showFocus;if(showFocus)$('focus-image').src='/api/focus/frame?t='+Date.now();refresh();};
+$('refine').onclick=async()=>{try{await api('focus/refine',{});await refresh();}catch(e){$('error').textContent=e.message;}};
+for(const id of ['trajectory','verify-interval']) $(id).onchange=async()=>{try{await api('attention/settings',{trajectory:$('trajectory').checked,verify_interval:Number($('verify-interval').value)});await refresh();}catch(e){$('error').textContent=e.message;}};
 $('help').onclick=()=>$('manual').showModal();refresh();setInterval(refresh,1000);

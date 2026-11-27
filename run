@@ -5,4 +5,8 @@ if [[ ! -x .venv/bin/python ]]; then
     echo 'Create .venv and install requirements.txt first.' >&2
     exit 1
 fi
-exec .venv/bin/python -m uvicorn backend.app:app --host 127.0.0.1 --port 8090 --no-access-log
+if ! .venv/bin/python -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",8090)); s.close()' 2>/dev/null; then
+    echo 'Port 8090 unavailable. Use ./status or ./stop to check VisionLab.' >&2
+    exit 1
+fi
+exec .venv/bin/python -m uvicorn backend.app:app --host 127.0.0.1 --port 8090 --no-access-log --timeout-graceful-shutdown 5

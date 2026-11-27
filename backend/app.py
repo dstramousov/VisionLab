@@ -1,5 +1,7 @@
 """Local camera and inference control service."""
 import base64
+from collections import deque
+import numpy as np
 import json
 import logging
 import sqlite3
@@ -20,6 +22,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from backend.grounding import parse_box
+from backend.tracking import pixel_box, create_tracker
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA = ROOT / 'data'
@@ -93,6 +96,14 @@ class Lab:
         self.orientation_epoch = 0
         self.focus: dict[str, Any] | None = None
         self.focus_frame: bytes | None = None
+        self.tracking = False
+        self.track_job = None
+        self.track_epoch = 0
+        self.track_frame: bytes | None = None
+        self.history = deque(maxlen=60)
+        self.retry_at = 0.0
+        self.losses = 0
+        self.retries = 0
         self.started = 0.0
         self.previous_frame: bytes | None = None
         self.change_score = 0.0
@@ -127,6 +138,28 @@ class Lab:
         self.worker = threading.Thread(target=self.loop, daemon=True)
         self.worker.start()
 
+    def reset_tracking(self) -> None:
+        """Invalidate pending tracker work while holding the state lock."""
+        self.tracking = False
+        self.track_epoch += 1
+        self.track_job = None
+        self.track_frame = None
+        self.history.clear()
+
+    def tracking_event(self, message: str) -> None:
+        """Record a tracking state transition while holding the state lock."""
+        stamp = datetime.now().astimezone().isoformat(timespec='milliseconds')
+        event = {'captured': stamp, 'kind': 'tracking', 'question': '',
+                 'answer': message, 'seconds': 0, 'reasoning': ''}
+        self.events = (self.events + [event])[-100:]
+        if self.settings.save_observations:
+            try:
+                with sqlite3.connect(DATA / 'observations.sqlite3') as db:
+                    db.execute('INSERT INTO events (captured,kind,question,answer,seconds,settings,frame) VALUES (?,?,?,?,?,?,?)',
+                               (stamp, 'tracking', '', message, 0, self.settings.model_dump_json(), None))
+            except sqlite3.Error:
+                LOG.exception('Cannot save tracking event')
+
     def camera_on(self) -> None:
         with self.lock:
             if self.camera_thread and self.camera_thread.is_alive():
@@ -135,6 +168,7 @@ class Lab:
             self.orientation_epoch += 1
             self.focus = None
             self.focus_frame = None
+            self.reset_tracking()
             self.camera_stop.clear()
             self.error = ''
             settings = self.settings.model_copy()
@@ -151,6 +185,9 @@ class Lab:
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, settings.height)
             cap.set(cv2.CAP_PROP_FPS, settings.fps)
             count, start = 0, time.monotonic()
+            tracker = None
+            tracker_epoch = -1
+            last_history = 0.0
             while not self.camera_stop.is_set():
                 ok, image = cap.read()
                 if not ok:
@@ -172,10 +209,62 @@ class Lab:
                     if epoch != self.orientation_epoch:
                         continue
                     self.frame = encoded.tobytes()
+                    if now - last_history >= 0.25:
+                        self.history.append((now, self.frame))
+                        last_history = now
+                    track_epoch = self.track_epoch
+                    job = self.track_job
+                    self.track_job = None
+                    tracking = self.tracking
+                    replay = list(self.history) if job else []
                     self.frame_time = datetime.now().astimezone().isoformat(timespec='milliseconds')
                     if now - start >= 1:
                         self.fps = count / (now - start)
                         count, start = 0, now
+                if tracker_epoch != track_epoch:
+                    tracker = None
+                    tracker_epoch = track_epoch
+                rectangle = None
+                if tracking:
+                    try:
+                        if job:
+                            source, box, submitted = job
+                            original = cv2.imdecode(np.frombuffer(source, np.uint8), cv2.IMREAD_COLOR)
+                            if now - submitted > 14:
+                                raise RuntimeError('Кадр поиска устарел')
+                            tracker = create_tracker()
+                            tracker.init(original, pixel_box(box, original.shape[1], original.shape[0]))
+                            for moment, jpeg in replay:
+                                if moment > submitted:
+                                    sample = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
+                                    success, _ = tracker.update(sample)
+                                    if not success:
+                                        raise RuntimeError('Объект потерян при переходе к LIVE')
+                        if tracker is not None:
+                            success, rectangle = tracker.update(image)
+                            if not success:
+                                raise RuntimeError('Объект потерян')
+                    except (cv2.error, RuntimeError) as exc:
+                        tracker = None
+                        rectangle = None
+                        with self.lock:
+                            if track_epoch == self.track_epoch and self.tracking and self.focus:
+                                self.focus.update(state='lost', live_box=None)
+                                self.track_frame = None
+                                self.losses += 1
+                                self.retry_at = time.monotonic() + 2
+                                self.tracking_event(str(exc))
+                if rectangle is not None:
+                    x, y, w, h = map(int, rectangle)
+                    annotated = image.copy()
+                    cv2.rectangle(annotated, (x, y), (x+w-1, y+h-1), (70, 230, 70), 2)
+                    valid, overlay = cv2.imencode('.jpg', annotated)
+                    with self.lock:
+                        if track_epoch == self.track_epoch and self.tracking and self.focus:
+                            if self.focus['state'] != 'tracking':
+                                self.tracking_event('Начато отслеживание: ' + self.focus['target'])
+                            self.focus.update(state='tracking', live_box=[x,y,w,h])
+                            self.track_frame = overlay.tobytes() if valid else None
         except Exception as exc:
             LOG.exception('Capture failed')
             with self.lock:
@@ -186,6 +275,9 @@ class Lab:
                 self.frame = None
                 self.fps = 0
                 self.auto = False
+                self.reset_tracking()
+                self.focus = None
+                self.focus_frame = None
 
     def camera_off(self) -> None:
         with self.lock:
@@ -194,6 +286,7 @@ class Lab:
             self.orientation_epoch += 1
             self.focus = None
             self.focus_frame = None
+            self.reset_tracking()
             self.frame = None
         if self.camera_thread:
             self.camera_thread.join(timeout=2)
@@ -227,6 +320,9 @@ class Lab:
     def model_off(self) -> None:
         with self.lock:
             self.auto = False
+            self.reset_tracking()
+            self.focus = None
+            self.focus_frame = None
             process = self.process
             if process and process.poll() is None:
                 process.terminate()
@@ -239,7 +335,7 @@ class Lab:
 
     def submit(self, text: str, kind: str) -> None:
         with self.lock:
-            if kind == 'focus' and self.auto:
+            if kind in ('focus', 'track') and self.auto:
                 raise RuntimeError('Остановите автоанализ перед поиском объекта')
             if self.busy:
                 raise RuntimeError('Анализ уже выполняется')
@@ -253,16 +349,22 @@ class Lab:
             self.last, self.last_time = frame, stamp
             settings = self.settings.model_copy()
             epoch = self.orientation_epoch
-            if kind == 'focus':
+            if kind in ('focus', 'track'):
+                self.track_epoch += 1
+                self.track_frame = None
+                self.track_job = None
+                self.tracking = kind == 'track'
                 self.focus = {'target': text, 'captured': stamp, 'state': 'searching', 'box': None}
                 self.focus_frame = frame
-        threading.Thread(target=self.infer, args=(text, kind, frame, stamp, settings, epoch), daemon=True).start()
+            track_epoch = self.track_epoch
+            submitted = self.started
+        threading.Thread(target=self.infer, args=(text, kind, frame, stamp, settings, epoch, track_epoch, submitted), daemon=True).start()
 
-    def infer(self, text: str, kind: str, frame: bytes, stamp: str, settings: Settings, epoch: int) -> None:
+    def infer(self, text: str, kind: str, frame: bytes, stamp: str, settings: Settings, epoch: int, track_epoch: int, submitted: float) -> None:
         start = time.monotonic()
         try:
             content = []
-            if kind == 'focus':
+            if kind in ('focus', 'track'):
                 text_for_model = (
                     'Locate the requested object in this image. Return only JSON '
                     'with one key "box": [x1,y1,x2,y2] using integer coordinates '
@@ -275,7 +377,7 @@ class Lab:
             else:
                 text_for_model = text
             content.extend([{'type': 'text', 'text': 'Текущий кадр:'}, image_part(frame), {'type': 'text', 'text': text_for_model}])
-            payload = {'messages': [{'role': 'system', 'content': ('You localize objects in images. Return only the requested JSON.' if kind == 'focus' else settings.prompt)}, {'role': 'user', 'content': content}], 'max_tokens': settings.max_tokens, 'temperature': 0.1 if kind == 'focus' else settings.temperature, 'stream': True}
+            payload = {'messages': [{'role': 'system', 'content': ('You localize objects in images. Return only the requested JSON.' if kind in ('focus', 'track') else settings.prompt)}, {'role': 'user', 'content': content}], 'max_tokens': settings.max_tokens, 'temperature': 0.1 if kind in ('focus', 'track') else settings.temperature, 'stream': True}
             raw_answer = reasoning = ''
             finish = None
             with requests.post(f'{API}/v1/chat/completions', json=payload, timeout=(10, 180), stream=True) as response:
@@ -301,9 +403,9 @@ class Lab:
             answer, thought = split_reasoning(raw_answer, reasoning)
             if finish is None:
                 raise RuntimeError('Поток ответа завершился без причины остановки')
-            if kind == 'focus':
+            if kind in ('focus', 'track'):
                 box = None
-                state = 'invalid'
+                state = 'limit' if finish == 'length' else 'invalid'
                 if finish == 'stop':
                     try:
                         box = parse_box(answer)
@@ -311,11 +413,20 @@ class Lab:
                     except ValueError:
                         pass
                 with self.lock:
-                    if epoch == self.orientation_epoch and self.focus is not None:
+                    if epoch == self.orientation_epoch and track_epoch == self.track_epoch and self.focus is not None:
                         self.focus.update(state=state, box=box)
+                        if kind == 'track':
+                            if box is not None:
+                                self.track_job = (frame, box, submitted)
+                                self.focus['state'] = 'initializing'
+                            else:
+                                self.retry_at = time.monotonic() + 3
+                        self.tracking_event(f'{text}: {state}')
+            if kind in ('focus', 'track') and not answer.strip() and finish != 'length':
+                answer = '[Пустой ответ локализации]'
             if finish == 'length':
                 answer += '\n[Достигнут лимит генерации]'
-            if not answer.strip():
+            if not answer.strip() and kind not in ('focus', 'track'):
                 raise RuntimeError('Модель не вернула текст ответа')
             elapsed = time.monotonic() - start
             event = {'captured': stamp, 'kind': kind, 'question': text, 'answer': answer, 'reasoning': thought, 'finish': finish, 'seconds': round(elapsed, 2)}
@@ -335,8 +446,9 @@ class Lab:
             with self.lock:
                 self.error = str(exc)
                 self.auto = False
-                if kind == 'focus' and epoch == self.orientation_epoch and self.focus is not None:
+                if kind in ('focus', 'track') and epoch == self.orientation_epoch and track_epoch == self.track_epoch and self.focus is not None:
                     self.focus.update(state='error', box=None)
+                    self.retry_at = time.monotonic() + 3
         finally:
             with self.lock:
                 self.busy = False
@@ -346,6 +458,15 @@ class Lab:
         next_at = 0.0
         while not self.shutdown.wait(0.2):
             with self.lock:
+                if (self.tracking and self.focus and not self.busy and not self.auto
+                        and self.focus['state'] in ('lost', 'missing', 'limit', 'invalid', 'error')
+                        and time.monotonic() >= self.retry_at and self.frame):
+                    try:
+                        self.submit(self.focus['target'], 'track')
+                        self.retries += 1
+                        self.tracking_event('Повторный поиск: ' + self.focus['target'])
+                    except RuntimeError:
+                        self.retry_at = time.monotonic() + 3
                 if not self.auto or self.busy:
                     next_at = time.monotonic() + self.settings.interval
                     continue
@@ -378,7 +499,7 @@ async def lifespan(app: FastAPI):
         lab.model_off()
 
 
-app = FastAPI(title='VisionLab', version='0.0.3', lifespan=lifespan)
+app = FastAPI(title='VisionLab', version='0.0.4', lifespan=lifespan)
 
 
 @app.middleware('http')
@@ -400,7 +521,7 @@ def status() -> dict[str, Any]:
     except (OSError, subprocess.SubprocessError, IndexError):
         gpu = '—'
     with lab.lock:
-        return {'camera': lab.frame is not None, 'camera_active': bool(lab.camera_thread and lab.camera_thread.is_alive()), 'model': lab.ready(), 'model_active': bool(lab.process and lab.process.poll() is None), 'auto': lab.auto, 'busy': lab.busy, 'fps': round(lab.fps, 1), 'error': lab.error, 'duration': round(lab.duration, 2), 'ram': round(psutil.virtual_memory().available / 1024**3, 1), 'gpu': gpu, 'last_time': lab.last_time, 'elapsed': round(time.monotonic()-lab.started, 1) if lab.busy else 0, 'change_score': round(lab.change_score, 2), 'focus': dict(lab.focus) if lab.focus else None, 'settings': lab.settings.model_dump(), 'devices': sorted(str(p) for p in Path('/dev').glob('video[0-9]*'))}
+        return {'camera': lab.frame is not None, 'camera_active': bool(lab.camera_thread and lab.camera_thread.is_alive()), 'model': lab.ready(), 'model_active': bool(lab.process and lab.process.poll() is None), 'auto': lab.auto, 'busy': lab.busy, 'fps': round(lab.fps, 1), 'error': lab.error, 'duration': round(lab.duration, 2), 'ram': round(psutil.virtual_memory().available / 1024**3, 1), 'gpu': gpu, 'last_time': lab.last_time, 'elapsed': round(time.monotonic()-lab.started, 1) if lab.busy else 0, 'change_score': round(lab.change_score, 2), 'focus': dict(lab.focus) if lab.focus else None, 'tracking': lab.tracking, 'losses': lab.losses, 'retries': lab.retries, 'settings': lab.settings.model_dump(), 'devices': sorted(str(p) for p in Path('/dev').glob('video[0-9]*'))}
 
 
 @app.post('/api/settings')
@@ -418,6 +539,7 @@ def settings(value: Settings) -> dict[str, bool]:
             lab.previous_frame = None
             lab.focus = None
             lab.focus_frame = None
+            lab.reset_tracking()
             lab.change_score = 0
             lab.frame = None
         lab.settings = value
@@ -440,6 +562,8 @@ def control(action: str) -> dict[str, bool]:
             with lab.lock:
                 if not lab.frame or not lab.ready():
                     raise RuntimeError('Включите камеру и модель')
+                if lab.tracking:
+                    raise RuntimeError('Снимите фокус перед автоанализом')
                 lab.previous_frame = None
                 lab.auto = True
         elif action == 'auto-off':
@@ -474,12 +598,26 @@ def focus(value: Question) -> dict[str, bool]:
     return {'ok': True}
 
 
+@app.post('/api/track')
+def track(value: Question) -> dict[str, bool]:
+    """Start text-guided live tracking and automatic reacquisition."""
+    try:
+        create_tracker()
+        with lab.lock:
+            lab.submit(value.text, 'track')
+            lab.losses = lab.retries = 0
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {'ok': True}
+
+
 @app.post('/api/focus/clear')
 def clear_focus() -> dict[str, bool]:
     """Clear the displayed localization without deleting observations."""
     with lab.lock:
         lab.focus = None
         lab.focus_frame = None
+        lab.reset_tracking()
     return {'ok': True}
 
 
@@ -494,9 +632,8 @@ def focus_frame() -> Response:
         image = cv2.imdecode(np.frombuffer(frame, dtype=np.uint8), cv2.IMREAD_COLOR)
         if image is not None:
             height, width = image.shape[:2]
-            x1, y1, x2, y2 = box
-            cv2.rectangle(image, (x1 * (width-1)//1000, y1 * (height-1)//1000),
-                          (x2 * (width-1)//1000, y2 * (height-1)//1000), (70, 230, 70), 2)
+            x, y, w, h = pixel_box(box, width, height)
+            cv2.rectangle(image, (x, y), (x+w-1, y+h-1), (70, 230, 70), 2)
             ok, encoded = cv2.imencode('.jpg', image)
             if ok:
                 frame = encoded.tobytes()
@@ -521,7 +658,7 @@ def stream() -> StreamingResponse:
     def frames():
         while not lab.shutdown.is_set():
             with lab.lock:
-                frame = lab.frame
+                frame = lab.track_frame if lab.tracking and lab.track_frame else lab.frame
             if frame:
                 yield b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + frame + b'\r\n'
             time.sleep(1 / 30)

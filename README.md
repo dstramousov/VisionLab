@@ -19,3 +19,11 @@ python3 -m venv .venv
 Проверки: `python -m unittest discover -s tests` и `node --check frontend/app.js`.
 
 Зеркальный режим и вертикальный переворот применяются в OpenCV до передачи модели. Поиск объекта использует Qwen3.5 и проверяет формат координат 0..1000; рамка отображается на снимке поиска, не является непрерывным трекингом. Остановите автоанализ перед поиском. Точность необходимо проверить экспериментально.
+
+## v0.0.4
+
+- Experimental CSRT live tracking with bounded frame replay and automatic reacquisition.
+- Separate raw inference frames and annotated live stream; tracking transitions in SQLite.
+- Replace opencv-python-headless with opencv-contrib-python-headless (uninstall the former first).
+- Tracking and automatic scene analysis are mutually exclusive. Tracker drift and capture slowdown are possible.
+- Add ./stop, ./restart and ./status for project-owned backend processes; restart runs in foreground.

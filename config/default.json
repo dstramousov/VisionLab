@@ -1,0 +1,1 @@
+{"llmlab_root":"/storage/llm-lab","camera":"/dev/video0","width":640,"height":480,"fps":30,"interval":5,"prompt":"Описывай только наблюдаемые детали кадра. Отвечай по-русски. Не выдумывай события.","save_observations":true,"save_frames":false}

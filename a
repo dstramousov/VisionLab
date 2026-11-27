@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
+version=$(cat VERSION)
+[[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 1
+archive="$HOME/Downloads/VisionLab-source-v${version}.tar.gz"
+mkdir -p "$HOME/Downloads"
+tar -czf "$archive" --exclude='./.git' --exclude='./.venv*' --exclude='./data' --exclude='./.env*' --exclude='./config/local.json' --exclude='__pycache__' --exclude='.pytest_cache' --exclude='*.gguf' --exclude='*.log' --exclude='*.sqlite*' --exclude='*.jpg' --exclude='*.jpeg' --exclude='*.png' --exclude='*.mp4' --exclude='*.zip' --exclude='*.tar.gz' .
+printf 'Archive: %s\n' "$archive"

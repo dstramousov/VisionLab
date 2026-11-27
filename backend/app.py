@@ -19,6 +19,8 @@ from fastapi.responses import Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from backend.grounding import parse_box
+
 ROOT = Path(__file__).resolve().parents[1]
 DATA = ROOT / 'data'
 API = 'http://127.0.0.1:8084'
@@ -68,6 +70,8 @@ class Settings(BaseModel):
     save_frames: bool = False
     max_tokens: int = Field(default=2048, ge=128, le=4096)
     temperature: float = Field(default=0.4, ge=0, le=2)
+    mirror: bool = False
+    vertical_flip: bool = False
     changes_only: bool = False
     change_threshold: float = Field(default=8.0, ge=1, le=100)
 
@@ -86,6 +90,9 @@ class Lab:
         self.root = Path(raw.pop('llmlab_root'))
         self.settings = Settings(**raw)
         self.pending: dict[str, Any] | None = None
+        self.orientation_epoch = 0
+        self.focus: dict[str, Any] | None = None
+        self.focus_frame: bytes | None = None
         self.started = 0.0
         self.previous_frame: bytes | None = None
         self.change_score = 0.0
@@ -125,6 +132,9 @@ class Lab:
             if self.camera_thread and self.camera_thread.is_alive():
                 return
             self.previous_frame = None
+            self.orientation_epoch += 1
+            self.focus = None
+            self.focus_frame = None
             self.camera_stop.clear()
             self.error = ''
             settings = self.settings.model_copy()
@@ -145,6 +155,12 @@ class Lab:
                 ok, image = cap.read()
                 if not ok:
                     raise RuntimeError('Ошибка захвата кадра')
+                with self.lock:
+                    epoch = self.orientation_epoch
+                    mirror = self.settings.mirror
+                    vertical = self.settings.vertical_flip
+                if mirror or vertical:
+                    image = cv2.flip(image, -1 if mirror and vertical else 1 if mirror else 0)
                 ok, encoded = cv2.imencode('.jpg', image)
                 if not ok:
                     continue
@@ -153,6 +169,8 @@ class Lab:
                 with self.lock:
                     if self.camera_stop.is_set():
                         break
+                    if epoch != self.orientation_epoch:
+                        continue
                     self.frame = encoded.tobytes()
                     self.frame_time = datetime.now().astimezone().isoformat(timespec='milliseconds')
                     if now - start >= 1:
@@ -173,6 +191,9 @@ class Lab:
         with self.lock:
             self.auto = False
             self.camera_stop.set()
+            self.orientation_epoch += 1
+            self.focus = None
+            self.focus_frame = None
             self.frame = None
         if self.camera_thread:
             self.camera_thread.join(timeout=2)
@@ -218,6 +239,8 @@ class Lab:
 
     def submit(self, text: str, kind: str) -> None:
         with self.lock:
+            if kind == 'focus' and self.auto:
+                raise RuntimeError('Остановите автоанализ перед поиском объекта')
             if self.busy:
                 raise RuntimeError('Анализ уже выполняется')
             if not self.frame or not self.ready():
@@ -229,19 +252,30 @@ class Lab:
             frame, stamp = self.frame, self.frame_time
             self.last, self.last_time = frame, stamp
             settings = self.settings.model_copy()
-        threading.Thread(target=self.infer, args=(text, kind, frame, stamp, settings), daemon=True).start()
+            epoch = self.orientation_epoch
+            if kind == 'focus':
+                self.focus = {'target': text, 'captured': stamp, 'state': 'searching', 'box': None}
+                self.focus_frame = frame
+        threading.Thread(target=self.infer, args=(text, kind, frame, stamp, settings, epoch), daemon=True).start()
 
-    def infer(self, text: str, kind: str, frame: bytes, stamp: str, settings: Settings) -> None:
+    def infer(self, text: str, kind: str, frame: bytes, stamp: str, settings: Settings, epoch: int) -> None:
         start = time.monotonic()
         try:
             content = []
-            if kind == 'auto' and self.previous_frame is not None:
+            if kind == 'focus':
+                text_for_model = (
+                    'Locate the requested object in this image. Return only JSON '
+                    'with one key "box": [x1,y1,x2,y2] using integer coordinates '
+                    'normalized to 0..1000, origin top left, x right, y down. '
+                    'If not visible return {"box":null}. Target: ' + text
+                )
+            elif kind == 'auto' and self.previous_frame is not None:
                 content.extend([{'type': 'text', 'text': 'Предыдущий кадр:'}, image_part(self.previous_frame)])
                 text_for_model = 'Сравни предыдущий и текущий кадры. Кратко опиши только видимые изменения; если их нет, так и скажи.'
             else:
                 text_for_model = text
             content.extend([{'type': 'text', 'text': 'Текущий кадр:'}, image_part(frame), {'type': 'text', 'text': text_for_model}])
-            payload = {'messages': [{'role': 'system', 'content': settings.prompt}, {'role': 'user', 'content': content}], 'max_tokens': settings.max_tokens, 'temperature': settings.temperature, 'stream': True}
+            payload = {'messages': [{'role': 'system', 'content': ('You localize objects in images. Return only the requested JSON.' if kind == 'focus' else settings.prompt)}, {'role': 'user', 'content': content}], 'max_tokens': settings.max_tokens, 'temperature': 0.1 if kind == 'focus' else settings.temperature, 'stream': True}
             raw_answer = reasoning = ''
             finish = None
             with requests.post(f'{API}/v1/chat/completions', json=payload, timeout=(10, 180), stream=True) as response:
@@ -267,6 +301,18 @@ class Lab:
             answer, thought = split_reasoning(raw_answer, reasoning)
             if finish is None:
                 raise RuntimeError('Поток ответа завершился без причины остановки')
+            if kind == 'focus':
+                box = None
+                state = 'invalid'
+                if finish == 'stop':
+                    try:
+                        box = parse_box(answer)
+                        state = 'found' if box is not None else 'missing'
+                    except ValueError:
+                        pass
+                with self.lock:
+                    if epoch == self.orientation_epoch and self.focus is not None:
+                        self.focus.update(state=state, box=box)
             if finish == 'length':
                 answer += '\n[Достигнут лимит генерации]'
             if not answer.strip():
@@ -275,7 +321,7 @@ class Lab:
             event = {'captured': stamp, 'kind': kind, 'question': text, 'answer': answer, 'reasoning': thought, 'finish': finish, 'seconds': round(elapsed, 2)}
             if kind == 'auto':
                 with self.lock:
-                    if not self.camera_stop.is_set():
+                    if not self.camera_stop.is_set() and epoch == self.orientation_epoch:
                         self.previous_frame = frame
             if settings.save_observations:
                 with sqlite3.connect(DATA / 'observations.sqlite3') as db:
@@ -289,6 +335,8 @@ class Lab:
             with self.lock:
                 self.error = str(exc)
                 self.auto = False
+                if kind == 'focus' and epoch == self.orientation_epoch and self.focus is not None:
+                    self.focus.update(state='error', box=None)
         finally:
             with self.lock:
                 self.busy = False
@@ -330,7 +378,7 @@ async def lifespan(app: FastAPI):
         lab.model_off()
 
 
-app = FastAPI(title='VisionLab', version='0.0.2', lifespan=lifespan)
+app = FastAPI(title='VisionLab', version='0.0.3', lifespan=lifespan)
 
 
 @app.middleware('http')
@@ -352,7 +400,7 @@ def status() -> dict[str, Any]:
     except (OSError, subprocess.SubprocessError, IndexError):
         gpu = '—'
     with lab.lock:
-        return {'camera': lab.frame is not None, 'camera_active': bool(lab.camera_thread and lab.camera_thread.is_alive()), 'model': lab.ready(), 'model_active': bool(lab.process and lab.process.poll() is None), 'auto': lab.auto, 'busy': lab.busy, 'fps': round(lab.fps, 1), 'error': lab.error, 'duration': round(lab.duration, 2), 'ram': round(psutil.virtual_memory().available / 1024**3, 1), 'gpu': gpu, 'last_time': lab.last_time, 'elapsed': round(time.monotonic()-lab.started, 1) if lab.busy else 0, 'change_score': round(lab.change_score, 2), 'settings': lab.settings.model_dump(), 'devices': sorted(str(p) for p in Path('/dev').glob('video[0-9]*'))}
+        return {'camera': lab.frame is not None, 'camera_active': bool(lab.camera_thread and lab.camera_thread.is_alive()), 'model': lab.ready(), 'model_active': bool(lab.process and lab.process.poll() is None), 'auto': lab.auto, 'busy': lab.busy, 'fps': round(lab.fps, 1), 'error': lab.error, 'duration': round(lab.duration, 2), 'ram': round(psutil.virtual_memory().available / 1024**3, 1), 'gpu': gpu, 'last_time': lab.last_time, 'elapsed': round(time.monotonic()-lab.started, 1) if lab.busy else 0, 'change_score': round(lab.change_score, 2), 'focus': dict(lab.focus) if lab.focus else None, 'settings': lab.settings.model_dump(), 'devices': sorted(str(p) for p in Path('/dev').glob('video[0-9]*'))}
 
 
 @app.post('/api/settings')
@@ -365,6 +413,13 @@ def settings(value: Settings) -> dict[str, bool]:
         temp = DATA / 'settings.tmp'
         temp.write_text(value.model_dump_json(indent=2))
         temp.replace(DATA / 'settings.json')
+        if (old.mirror, old.vertical_flip) != (value.mirror, value.vertical_flip):
+            lab.orientation_epoch += 1
+            lab.previous_frame = None
+            lab.focus = None
+            lab.focus_frame = None
+            lab.change_score = 0
+            lab.frame = None
         lab.settings = value
     return {'ok': True}
 
@@ -407,6 +462,46 @@ def question(value: Question) -> dict[str, bool]:
     except RuntimeError as exc:
         raise HTTPException(409, str(exc)) from exc
     return {'ok': True}
+
+
+@app.post('/api/focus')
+def focus(value: Question) -> dict[str, bool]:
+    """Localize one text-specified object on a fresh camera frame."""
+    try:
+        lab.submit(value.text, 'focus')
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {'ok': True}
+
+
+@app.post('/api/focus/clear')
+def clear_focus() -> dict[str, bool]:
+    """Clear the displayed localization without deleting observations."""
+    with lab.lock:
+        lab.focus = None
+        lab.focus_frame = None
+    return {'ok': True}
+
+
+@app.get('/api/focus/frame')
+def focus_frame() -> Response:
+    """Return the localized snapshot with its validated bounding box."""
+    with lab.lock:
+        frame = lab.focus_frame
+        box = lab.focus.get('box') if lab.focus else None
+    if frame and box:
+        import numpy as np
+        image = cv2.imdecode(np.frombuffer(frame, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if image is not None:
+            height, width = image.shape[:2]
+            x1, y1, x2, y2 = box
+            cv2.rectangle(image, (x1 * (width-1)//1000, y1 * (height-1)//1000),
+                          (x2 * (width-1)//1000, y2 * (height-1)//1000), (70, 230, 70), 2)
+            ok, encoded = cv2.imencode('.jpg', image)
+            if ok:
+                frame = encoded.tobytes()
+    return Response(frame or b'', media_type='image/jpeg', status_code=200 if frame else 404,
+                    headers={'Cache-Control': 'no-store'})
 
 
 @app.get('/api/events')

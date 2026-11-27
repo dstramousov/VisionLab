@@ -10,3 +10,8 @@
 - Generation settings, elapsed timer and persisted local configuration.
 - Automatic two-frame comparison and optional grayscale change threshold.
 - Adapted a and appr; added run helper with quiet access logging.
+
+## 0.0.3
+- Persisted horizontal and vertical camera transforms.
+- Experimental text-guided object localization on a captured frame.
+- Validated bounding boxes and snapshot/live view switch.
